@@ -72,8 +72,8 @@ inline constexpr auto decode64 = [] {
 		       static constexpr auto illegal = 0x80;
 		       static constexpr auto flag = 0x40;
 
-		       static constexpr auto lookup = [] -> std::array<uint8_t, 0xFF> {
-			       std::array<uint8_t, 0xFF> a{};
+		       static constexpr auto lookup = [] -> std::array<uint8_t, 256> {
+			       std::array<uint8_t, 256> a{};
 			       a.fill(illegal);
 			       uint8_t i{};
 			       for (const auto c : base64::detail::base64_chars) {
