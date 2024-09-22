@@ -1,3 +1,5 @@
+#pragma once
+
 #include <algorithm> // IWYU pragma: keep
 #include <ranges>
 #include <string_view>
