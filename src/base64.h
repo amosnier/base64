@@ -1,10 +1,14 @@
 #pragma once
 
 #include <algorithm> // IWYU pragma: keep
+/* #include <array> */
+#include <cstddef>
+/* #include <limits> */
+#include <limits>
 #include <ranges>
 #include <string_view>
 
-namespace base64::detail {
+namespace detail {
 inline constexpr auto base64_chars =
     std::string_view{"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"};
 }
@@ -14,29 +18,30 @@ inline constexpr auto base64_chars =
 // Usage example:
 //
 // \code{.cpp}
-// std::array{std::byte{'M'}, std::byte{'a'}, std::byte{'n'}} | encode64 // will generate view on "TWFu"sv
+// // Will generate a view on "TWFu"sv
+// std::array{std::byte{'M'}, std::byte{'a'}, std::byte{'n'}} | encode64
 // \endcode
 inline constexpr auto encode64 = [] {
 	using namespace std::views;
 	using std::ranges::fold_left;
 
-	return transform([](std::byte byte) -> uint32_t { return static_cast<uint32_t>(byte); }) | chunk(3) |
-	       transform([](auto &&triplet) {
-		       static constexpr auto shift = 24;
-		       static constexpr uint32_t one{1 << shift};
+	static constexpr auto shift = 24;
+	static constexpr unsigned long is_present = 1 << shift;
 
-		       // Note: we store the number of missing bytes (zero, one, or two) to the otherwise unused MSB, to
-		       // handle padding.
-		       const auto word = fold_left(triplet, 3 * one, [](uint32_t o1, uint32_t o2) -> uint32_t {
-			       static constexpr uint32_t mask{~(one - 1)};
-			       return ((o1 - one) & mask) | (o1 << 8) | o2;
-		       });
-
-		       const auto num_missing = static_cast<int>(word >> shift);
-
+	return transform(
+		   [](std::byte byte) -> unsigned long { return is_present | static_cast<unsigned long>(byte); }) |
+	       chunk(3) | transform([](auto &&triplet) {
+		       // Strategy: store the number of bytes in the fourth byte and the values in the three LSBs
+		       static constexpr auto present_mask = 0xFF << shift;
+		       static constexpr auto value_mask = static_cast<int>(is_present - 1);
+		       const auto word =
+			   fold_left(triplet, 0U, [](unsigned long o1, unsigned long o2) -> unsigned long {
+				   return ((o1 + o2) & present_mask) | (((o1 << 8) | o2) & value_mask);
+			   });
+		       const auto num_missing = static_cast<int>(3 - (word >> shift));
 		       return iota(0, 4) | reverse | transform([word, num_missing](int i) {
 				      return i < num_missing ? '='
-							     : base64::detail::base64_chars.at(
+							     : detail::base64_chars.at(
 								   (word << (8 * num_missing) >> (6 * i)) & 0x3F);
 			      });
 	       }) |
@@ -46,9 +51,13 @@ inline constexpr auto encode64 = [] {
 // @brief Adaptor that converts its RFC 4648 Base64 character input range into a std::byte range view.
 //
 // This implementation ambitions to strictly implement the RFC specification. In particular:
-// - Any octet triplet containing an illegal character is rejected, i.e. it is not emitted to the output view.
-// - In case of illegal padding, the implementation produces a result, but it is basically undefined (the RFC does not
-// mandate any other behaviour).
+// - Any octet triplet containing an illegal character or illegal or absent padding is rejected, i.e. it is not emitted
+// to the output view.
+// - Any octet triplet encoded with non-canonical encoding is rejected too. When there is one, respectively two padding
+// sextets, the previous 2, respectively 4 bits will not be emitted and are therefore supposed to be zero in the encoded
+// sextets. If that is not the case, the encoded sextets could still be decoded, but the encoding is considered as
+// non-canonical and the input may hence be rejected by a conformant implementation. This is what this implementation
+// does.
 //
 // The RFC mandates: "Implementations MUST reject the encoded data if it contains characters outside the base alphabet
 // when interpreting base-encoded data". This implementation does that, with an important caveat. Since it is
@@ -60,52 +69,60 @@ inline constexpr auto encode64 = [] {
 // Usage example:
 //
 // \code{.cpp}
-// "TWFu"sv | decode16 // will generate view on std::array{std::byte{'M'}, std::byte{'a'}, std::byte{'n'}}
+// // Will generate a view on std::array{std::byte{'M'}, std::byte{'a'}, std::byte{'n'}}
+// "TWFu"sv | decode64
 // \endcode
 inline constexpr auto decode64 = [] {
 	using namespace std::views;
-
 	using std::ranges::fold_left;
+	using ulong = unsigned long;
 
-	return transform([](char encoded) -> uint32_t {
-		       static constexpr auto u = std::bit_cast<char, uint8_t>;
-		       static constexpr auto illegal = 0x80;
-		       static constexpr auto flag = 0x40;
+	return transform([](char encoded) -> ulong {
+		       using lookup_t = std::array<unsigned char, std::numeric_limits<unsigned char>::max() + 1>;
 
-		       static constexpr auto lookup = [] -> std::array<uint8_t, 256> {
-			       std::array<uint8_t, 256> a{};
-			       a.fill(illegal);
-			       uint8_t i{};
-			       for (const auto c : base64::detail::base64_chars) {
-				       a.at(u(c)) = i++;
+		       // Base64 binary values are six bit-wide. We use the seventh and eighth bits for validity and
+		       // padding flags.
+		       static constexpr auto is_valid = 0x40;
+		       static constexpr auto is_padding = 0x80;
+
+		       static constexpr auto lookup = [] -> lookup_t {
+			       lookup_t a{};
+			       unsigned char i{};
+			       for (const unsigned char c : detail::base64_chars) {
+				       a.at(c) = is_valid | i++;
 			       }
-			       // Use the otherwise unused next to most significant bit as a padding flag.
-			       a.at(u('=')) = flag;
+			       a.at(static_cast<unsigned char>('=')) = is_padding | is_valid;
 			       return a;
 		       }();
 
-		       // Store sextet to a uint32_t, and move the padding flag to the MSB. This is analogous to what
-		       // we do during encoding. Move the illegal flag to the most significant nibble.
-		       const uint32_t n{lookup.at(u(encoded))};
-		       return ((n & flag) << 18) | ((n & illegal) << 21) | (n & ~(flag | illegal));
+		       // Expand to an unsigned long and move the valid and padding bits to the fourth byte to ease
+		       // folding. Note: the input range does not guarantee multi-pass and hence, folding will have to
+		       // transfer all the necessary information in one pass, i.e. not only the value but also validity
+		       // and padding information.
+		       const ulong sextet = lookup.at(static_cast<unsigned char>(encoded));
+		       return ((sextet & is_valid) << 18) | ((sextet & is_padding) << 21) | (sextet & 0x3F);
 	       }) |
 	       chunk(4) | transform([](auto &&quad) {
-		       static constexpr auto shift = 24;
-		       static constexpr uint32_t one{1 << shift};
-		       static constexpr uint32_t mask{one - 1};
-		       static constexpr auto max_num_octets = 3;
+		       static constexpr ulong padding_mask{0xF0000000};
+		       static constexpr ulong valid_mask = {padding_mask >> 4};
 
-		       const auto word = fold_left(quad, 0, [](uint32_t s1, uint32_t s2) {
-			       return ((s1 & ~mask) + (s2 & ~mask)) | ((s1 & mask) << 6) | (s2 & mask);
+		       const auto word = fold_left(quad, ulong{}, [](ulong s1, ulong s2) -> ulong {
+			       // If padding has been found, absence of padding on the incoming sextet is illegal.
+			       if ((s1 & padding_mask) && !(s2 & padding_mask)) {
+				       return 0; // force invalid state
+			       }
+			       return ((s1 + s2) & (padding_mask | valid_mask)) | (((s1 << 6) | s2) & 0xFFFFFF);
 		       });
-
-		       const auto is_illegal = (word >> (shift + 4)) > 0;
-		       const auto num_missing =
-			   is_illegal ? max_num_octets : static_cast<int>(word >> shift) & max_num_octets;
-
-		       return iota(0, max_num_octets - num_missing) | transform([word](int i) -> std::byte {
-				      return static_cast<std::byte>(word >> ((2 - i) * 8));
-			      });
+		       const auto num_padding = static_cast<int>((word & padding_mask) >> 28);
+		       const auto num_valid = static_cast<int>((word & valid_mask) >> 24);
+		       // If padding is used, the 2 or 4 least significant bits of the previous sextet are not used, so
+		       // under canonical encoding, they shall be zero. Since our lookup zeroes the rest of the padding
+		       // payload, we just check entire bytes, for clarity.
+		       const auto is_non_canonical =
+			   (num_padding == 1 && (word & 0xFF)) || (num_padding == 2 && (word & 0xFFFF));
+		       return iota(0, num_valid < 4 || num_padding > 2 || is_non_canonical ? 0 : 3 - num_padding) |
+			      transform(
+				  [word](int i) -> std::byte { return static_cast<std::byte>(word >> ((2 - i) * 8)); });
 	       }) |
 	       join;
 }();
