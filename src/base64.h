@@ -1,128 +1,253 @@
 #pragma once
 
-#include <algorithm> // IWYU pragma: keep
-/* #include <array> */
+#include <algorithm>
+#include <array>
+#include <bits/ranges_algo.h>
+#include <concepts>
 #include <cstddef>
-/* #include <limits> */
+#include <expected>
+#include <functional>
+#include <iostream>
+#include <iterator>
 #include <limits>
 #include <ranges>
 #include <string_view>
+#include <vector>
+
+enum class decode64_error : signed char {
+	illegal_character,
+	missing_character,
+	illegal_padding,
+	non_canonical,
+};
+
+template <typename I, typename O>
+struct decode64_error_result {
+	std::ranges::in_out_result<I, O> in_out_result;
+	decode64_error error;
+};
 
 namespace detail {
-inline constexpr auto base64_chars =
-    std::string_view{"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"};
+
+inline constexpr std::string_view base64_chars{"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"};
+
+namespace encode64 {
+
+struct encode : std::ranges::range_adaptor_closure<encode> {
+	template <std::ranges::viewable_range R>
+		requires std::convertible_to<std::ranges::range_reference_t<R>, std::byte>
+	constexpr auto operator()(R &&r) const
+	{
+		using namespace std::views;
+		using std::ranges::fold_left;
+
+		using ulong = unsigned long;
+
+		static constexpr auto shift = 24;
+
+		return cartesian_product(
+			   std::forward<R>(r) |
+			       transform([](std::byte byte) -> ulong { return static_cast<ulong>(byte); }) | chunk(3) |
+			       transform([](auto triplet) -> ulong {
+				       static constexpr ulong one_missing_byte{1 << shift};
+
+				       // Note: we store the number of missing bytes (zero, one, or two)
+				       // to the otherwise unused fourth byte, to handle padding.
+				       return fold_left(triplet, 3 * one_missing_byte, [](ulong o1, ulong o2) -> ulong {
+					       static constexpr ulong mask{one_missing_byte - 1};
+					       return ((o1 - one_missing_byte) & ~mask) | (((o1 << 8) | o2) & mask);
+				       });
+			       }),
+			   iota(0, 4) | reverse) |
+		       transform([](auto indexed_word) -> char {
+			       const auto [word, i] = indexed_word;
+			       const auto num_missing = static_cast<int>(word >> shift);
+
+			       std::cout << i << ", " << num_missing << '\n';
+
+			       return i < num_missing
+					  ? '='
+					  : detail::base64_chars.at((word << (8 * num_missing) >> (6 * i)) & 0x3F);
+		       });
+	}
+};
+
+} // namespace encode64
+
+namespace decode64 {
+
+constexpr auto max_size(size_t input_size) -> std::expected<size_t, decode64_error>
+{
+	if ((input_size % 4) != 0) {
+		return std::unexpected{decode64_error::missing_character};
+	}
+
+	return 3 * input_size / 4;
 }
 
-// @brief Adaptor that converts its std::byte input range into an RFC 4648 Base64 character range view
-//
-// Usage example:
-//
-// \code{.cpp}
-// // Will generate a view on "TWFu"sv
-// std::array{std::byte{'M'}, std::byte{'a'}, std::byte{'n'}} | encode64
-// \endcode
-inline constexpr auto encode64 = [] {
-	using namespace std::views;
-	using std::ranges::fold_left;
+struct try_decode {
+	template <std::input_iterator I, std::sentinel_for<I> S, std::weakly_incrementable O,
+		  typename Proj = std::identity>
+		requires(std::convertible_to<std::indirect_result_t<Proj, I>, char> and
+			 std::indirectly_writable<O, std::byte>)
+	constexpr auto operator()(I first1, S last1, O result, Proj proj = {}) const
+	    -> std::expected<std::ranges::in_out_result<I, O>, decode64_error_result<I, O>>
+	{
+		using namespace std::views;
 
-	static constexpr auto shift = 24;
-	static constexpr unsigned long is_present = 1 << shift;
+		using lookup_t = std::array<unsigned char, std::numeric_limits<unsigned char>::max() + 1>;
 
-	return transform(
-		   [](std::byte byte) -> unsigned long { return is_present | static_cast<unsigned long>(byte); }) |
-	       chunk(3) | transform([](auto &&triplet) {
-		       // Strategy: store the number of bytes in the fourth byte and the values in the three LSBs
-		       static constexpr auto present_mask = 0xFF << shift;
-		       static constexpr auto value_mask = static_cast<int>(is_present - 1);
-		       const auto word =
-			   fold_left(triplet, 0U, [](unsigned long o1, unsigned long o2) -> unsigned long {
-				   return ((o1 + o2) & present_mask) | (((o1 << 8) | o2) & value_mask);
-			   });
-		       const auto num_missing = static_cast<int>(3 - (word >> shift));
-		       return iota(0, 4) | reverse | transform([word, num_missing](int i) {
-				      return i < num_missing ? '='
-							     : detail::base64_chars.at(
-								   (word << (8 * num_missing) >> (6 * i)) & 0x3F);
-			      });
-	       }) |
-	       join;
-}();
+		static constexpr auto is_valid = 0x40;
+		static constexpr auto is_padding = 0x80;
 
-// @brief Adaptor that converts its RFC 4648 Base64 character input range into a std::byte range view.
-//
-// This implementation ambitions to strictly implement the RFC specification. In particular:
-// - Any octet triplet containing an illegal character or illegal or absent padding is rejected, i.e. it is not emitted
-// to the output view.
-// - Any octet triplet encoded with non-canonical encoding is rejected too. When there is one, respectively two padding
-// sextets, the previous 2, respectively 4 bits will not be emitted and are therefore supposed to be zero in the encoded
-// sextets. If that is not the case, the encoded sextets could still be decoded, but the encoding is considered as
-// non-canonical and the input may hence be rejected by a conformant implementation. This is what this implementation
-// does.
-//
-// The RFC mandates: "Implementations MUST reject the encoded data if it contains characters outside the base alphabet
-// when interpreting base-encoded data". This implementation does that, with an important caveat. Since it is
-// range-based, it has no way of rejecting more than one octet triplet at a time. Only higher level code has the ability
-// to reject larger chunks of data. Since this implementation does not emit illegal octets triplets, higher level
-// validation could for instance be achieved by comparing the size of the output produced by this implementation with
-// the expected output size.
-//
-// Usage example:
-//
-// \code{.cpp}
-// // Will generate a view on std::array{std::byte{'M'}, std::byte{'a'}, std::byte{'n'}}
-// "TWFu"sv | decode64
-// \endcode
-inline constexpr auto decode64 = [] {
-	using namespace std::views;
-	using std::ranges::fold_left;
-	using ulong = unsigned long;
+		static constexpr auto lookup = [] -> lookup_t {
+			lookup_t a{};
+			unsigned char i{};
+			for (const unsigned char c : detail::base64_chars) {
+				a.at(c) = is_valid | i++;
+			}
+			a.at(static_cast<unsigned char>('=')) = is_padding | is_valid;
+			return a;
+		}();
 
-	return transform([](char encoded) -> ulong {
-		       using lookup_t = std::array<unsigned char, std::numeric_limits<unsigned char>::max() + 1>;
+		while (first1 != last1) {
+			static constexpr auto chunk_size = 4;
+			using ulong = unsigned long;
+			ulong word{};
+			auto num_padding = 0;
+			auto i = 0;
+			for (i = 0; i < chunk_size and first1 != last1; ++i, ++first1) {
+				const auto sextet = lookup.at(static_cast<unsigned char>(std::invoke(proj, *first1)));
+				if (not(sextet & is_valid)) {
+					return std::unexpected{decode64_error_result<I, O>{
+					    .in_out_result = {std::move(first1), std::move(result)},
+					    .error = decode64_error::illegal_character,
+					}};
+				}
+				const auto sextet_is_padding = static_cast<int>(sextet >> 7);
+				if ((i < 2 and sextet_is_padding) or (num_padding and not sextet_is_padding)) {
+					return std::unexpected{decode64_error_result<I, O>{
+					    .in_out_result = {std::move(first1), std::move(result)},
+					    .error = decode64_error::illegal_padding,
+					}};
+				}
+				num_padding += sextet_is_padding;
+				word = (word << 6) | (sextet & 0x3F);
+			}
+			if (i != chunk_size) {
+				return std::unexpected{decode64_error_result<I, O>{
+				    .in_out_result = {std::move(first1), std::move(result)},
+				    .error = decode64_error::missing_character,
+				}};
+			}
+			if ((num_padding == 1 and (word & 0xC0)) or (num_padding == 2 and (word & 0xF000))) {
+				return std::unexpected{decode64_error_result<I, O>{
+				    .in_out_result = {std::move(first1), std::move(result)},
+				    .error = decode64_error::non_canonical,
+				}};
+			}
+			for (i = 0; i < 3 - num_padding; ++i) {
+				*result++ = static_cast<std::byte>(word >> ((2 - i) * 8));
+			}
+		}
 
-		       // Base64 binary values are six bit-wide. We use the seventh and eighth bits for validity and
-		       // padding flags.
-		       static constexpr auto is_valid = 0x40;
-		       static constexpr auto is_padding = 0x80;
+		return std::ranges::in_out_result<I, O>{std::move(first1), std::move(result)};
+	}
 
-		       static constexpr auto lookup = [] -> lookup_t {
-			       lookup_t a{};
-			       unsigned char i{};
-			       for (const unsigned char c : detail::base64_chars) {
-				       a.at(c) = is_valid | i++;
-			       }
-			       a.at(static_cast<unsigned char>('=')) = is_padding | is_valid;
-			       return a;
-		       }();
+	template <std::ranges::input_range R, std::weakly_incrementable O, typename Proj = std::identity>
+		requires(std::convertible_to<std::indirect_result_t<Proj, std::ranges::iterator_t<R>>, char> and
+			 std::indirectly_writable<O, std::byte>)
+	// NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
+	constexpr auto operator()(R &&r, O result, Proj proj = {}) const
+	    -> std::expected<std::ranges::in_out_result<std::ranges::borrowed_iterator_t<R>, O>,
+			     decode64_error_result<std::ranges::borrowed_iterator_t<R>, O>>
+	{
+		return (*this)(std::ranges::begin(r), std::ranges::end(r), std::move(result), std::move(proj));
+	}
+};
 
-		       // Expand to an unsigned long and move the valid and padding bits to the fourth byte to ease
-		       // folding. Note: the input range does not guarantee multi-pass and hence, folding will have to
-		       // transfer all the necessary information in one pass, i.e. not only the value but also validity
-		       // and padding information.
-		       const ulong sextet = lookup.at(static_cast<unsigned char>(encoded));
-		       return ((sextet & is_valid) << 18) | ((sextet & is_padding) << 21) | (sextet & 0x3F);
-	       }) |
-	       chunk(4) | transform([](auto &&quad) {
-		       static constexpr ulong padding_mask{0xF0000000};
-		       static constexpr ulong valid_mask = {padding_mask >> 4};
+} // namespace decode64
+} // namespace detail
 
-		       const auto word = fold_left(quad, ulong{}, [](ulong s1, ulong s2) -> ulong {
-			       // If padding has been found, absence of padding on the incoming sextet is illegal.
-			       if ((s1 & padding_mask) && !(s2 & padding_mask)) {
-				       return 0; // force invalid state
-			       }
-			       return ((s1 + s2) & (padding_mask | valid_mask)) | (((s1 << 6) | s2) & 0xFFFFFF);
-		       });
-		       const auto num_padding = static_cast<int>((word & padding_mask) >> 28);
-		       const auto num_valid = static_cast<int>((word & valid_mask) >> 24);
-		       // If padding is used, the 2 or 4 least significant bits of the previous sextet are not used, so
-		       // under canonical encoding, they shall be zero. Since our lookup zeroes the rest of the padding
-		       // payload, we just check entire bytes, for clarity.
-		       const auto is_non_canonical =
-			   (num_padding == 1 && (word & 0xFF)) || (num_padding == 2 && (word & 0xFFFF));
-		       return iota(0, num_valid < 4 || num_padding > 2 || is_non_canonical ? 0 : 3 - num_padding) |
-			      transform(
-				  [word](int i) -> std::byte { return static_cast<std::byte>(word >> ((2 - i) * 8)); });
-	       }) |
-	       join;
-}();
+inline constexpr detail::encode64::encode encode64{};
+inline constexpr detail::decode64::try_decode try_decode64{};
+
+template <typename R>
+	requires(std::ranges::sized_range<R> or std::ranges::forward_range<R>)
+// NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
+constexpr auto decode64_max_size(R &&r) -> std::expected<size_t, decode64_error>
+{
+	if constexpr (std::ranges::sized_range<R>) {
+		return detail::decode64::max_size(std::ranges::size(r));
+	} else {
+		return detail::decode64::max_size(std::ranges::distance(r));
+	}
+}
+
+namespace detail::decode64 {
+
+template <template <typename> typename C>
+struct try_decode_to {
+	template <std::ranges::input_range R, typename Proj = std::identity>
+		requires std::convertible_to<std::indirect_result_t<Proj, std::ranges::iterator_t<R>>, char>
+	constexpr auto operator()(R &&r, Proj proj = {}) const -> std::expected<C<std::byte>, decode64_error>;
+};
+
+template <>
+struct try_decode_to<std::vector> {
+	template <std::ranges::input_range R, typename Proj = std::identity>
+		requires std::convertible_to<std::indirect_result_t<Proj, std::ranges::iterator_t<R>>, char>
+	constexpr auto operator()(R &&r, Proj proj = {}) const -> std::expected<std::vector<std::byte>, decode64_error>
+	{
+		std::vector<std::byte> v{};
+
+		return try_decode64(std::forward<R>(r), std::back_insert_iterator{v}, std::move(proj))
+		    .transform([v = std::move(v)](auto &&) mutable { return std::move(v); })
+		    .transform_error([](const auto &error) { return error.error; });
+	}
+
+	template <std::ranges::input_range R, typename Proj = std::identity>
+		requires(std::convertible_to<std::indirect_result_t<Proj, std::ranges::iterator_t<R>>, char> and
+			 (std::ranges::sized_range<R> or std::ranges::forward_range<R>))
+	constexpr auto operator()(R &&r, Proj proj = {}) const -> std::expected<std::vector<std::byte>, decode64_error>
+	{
+		const auto size = decode64_max_size(std::forward<R>(r));
+
+		if (not size.has_value()) {
+			return std::unexpected{size.error()};
+		}
+
+		std::vector<std::byte> v(*size);
+
+		const auto result = try_decode64(std::forward<R>(r), v.begin(), std::move(proj));
+
+		if (result.has_value()) {
+			v.resize(result->out - v.begin());
+		}
+
+		return result.transform([v = std::move(v)](auto &&) mutable { return std::move(v); })
+		    .transform_error([](const auto &error) { return error.error; });
+	}
+};
+
+template <template <typename> typename C>
+	requires std::default_initializable<C<std::byte>>
+struct decode_to {
+	template <std::ranges::input_range R, typename Proj = std::identity>
+		requires std::convertible_to<std::indirect_result_t<Proj, std::ranges::iterator_t<R>>, char>
+	constexpr auto operator()(R &&r, Proj proj = {}) const -> C<std::byte>
+	{
+		return try_decode_to<C>{}(std::forward<R>(r), std::move(proj)).value_or(C<std::byte>{});
+	}
+};
+
+} // namespace detail::decode64
+
+template <template <typename> typename C>
+inline constexpr detail::decode64::try_decode_to<C> try_decode64_to{};
+
+template <template <typename> typename C>
+inline constexpr detail::decode64::decode_to<C> decode64_to{};
+
+inline constexpr auto try_decode64_to_vector = try_decode64_to<std::vector>;
+inline constexpr auto decode64_to_vector = decode64_to<std::vector>;
